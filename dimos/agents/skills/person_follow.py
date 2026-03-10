@@ -30,6 +30,7 @@ from dimos.models.qwen.bbox import BBox
 from dimos.models.vl.create import create
 from dimos.msgs.geometry_msgs import Twist
 from dimos.msgs.sensor_msgs import CameraInfo, Image, PointCloud2
+from dimos.navigation.patrolling.patrolling_module_spec import PatrollingModuleSpec
 from dimos.navigation.visual.query import get_object_bbox_from_image
 from dimos.navigation.visual_servoing.detection_navigation import DetectionNavigation
 from dimos.navigation.visual_servoing.visual_servoing_2d import VisualServoing2D
@@ -59,6 +60,7 @@ class PersonFollowSkillContainer(Module):
     _agent_spec: AgentSpec
     _frequency: float = 20.0  # Hz - control loop frequency
     _max_lost_frames: int = 15  # number of frames to wait before declaring person lost
+    _patrolling_module_spec: PatrollingModuleSpec
 
     def __init__(
         self,
@@ -107,7 +109,7 @@ class PersonFollowSkillContainer(Module):
         super().stop()
 
     @skill
-    def follow_person(self, query: str) -> str:
+    def follow_person(self, query: str, initial_bbox: list[float] | None = None) -> str:
         """Follow a person matching the given description using visual servoing.
 
         The robot will continuously track and follow the person, while keeping
@@ -115,6 +117,10 @@ class PersonFollowSkillContainer(Module):
 
         Args:
             query: Description of the person to follow (e.g., "man with blue shirt")
+            initial_bbox: Optional pre-computed bounding box [x1, y1, x2, y2].
+                If provided, skips the initial VL model detection step. This is
+                used by the continuation system to pass detection data directly
+                from look_out_for, avoiding a redundant detection.
 
         Returns:
             Status message indicating the result of the following action.
@@ -134,16 +140,24 @@ class PersonFollowSkillContainer(Module):
         if latest_image is None:
             return "No image available to detect person."
 
-        initial_bbox = get_object_bbox_from_image(
-            self._vl_model,
-            latest_image,
-            query,
-        )
+        if initial_bbox is not None:
+            bbox: BBox = (
+                initial_bbox[0],
+                initial_bbox[1],
+                initial_bbox[2],
+                initial_bbox[3],
+            )
+        else:
+            detected = get_object_bbox_from_image(
+                self._vl_model,
+                latest_image,
+                query,
+            )
+            if detected is None:
+                return f"Could not find '{query}' in the current view."
+            bbox = detected
 
-        if initial_bbox is None:
-            return f"Could not find '{query}' in the current view."
-
-        return self._follow_person(query, initial_bbox)
+        return self._follow_person(query, bbox)
 
     @skill
     def stop_following(self) -> str:
@@ -200,10 +214,20 @@ class PersonFollowSkillContainer(Module):
         self._thread = Thread(target=self._follow_loop, args=(tracker, query), daemon=True)
         self._thread.start()
 
-        return (
+        message = (
             "Found the person. Starting to follow. You can stop following by calling "
             "the 'stop_following' tool."
         )
+
+        if self._patrolling_module_spec.is_patrolling():
+            message += (
+                " Note: since the robot was patrolling, this has been stopped automatically "
+                "(the equivalent of calling the `stop_patrol` tool call) so you don't have "
+                "to do it. "
+            )
+            self._patrolling_module_spec.stop_patrol()
+
+        return message
 
     def _follow_loop(self, tracker: "EdgeTAMProcessor", query: str) -> None:
         lost_count = 0
